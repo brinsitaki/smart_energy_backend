@@ -2,7 +2,11 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 import firebase_admin
-from firebase_admin import credentials, firestore
+from firebase_admin import (
+    credentials,
+    firestore,
+    messaging
+)
 
 import pandas as pd
 import numpy as np
@@ -13,15 +17,18 @@ from datetime import datetime
 import os
 import uvicorn
 
-
+# ==================================================
+# FASTAPI
+# ==================================================
 
 app = FastAPI(
     title="Smart Energy API",
     version="1.0.0"
 )
 
-
-#############  CORS
+# ==================================================
+# CORS
+# ==================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,9 +38,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-#############  FIREBASE
+# ==================================================
+# FIREBASE
+# ==================================================
 
-cred = credentials.Certificate("firebase-key.json")
+cred = credentials.Certificate(
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"]
+)
 
 if not firebase_admin._apps:
     firebase_admin.initialize_app(cred)
@@ -43,15 +54,40 @@ db = firestore.client()
 print("✅ Firestore connected")
 
 # ==================================================
-# LOAD MODEL
+# LOAD MODELS
 # ==================================================
 
-model = joblib.load("energy_model.pkl")
+model = joblib.load(
+    "energy_model.pkl"
+)
 
 print("✅ ML model loaded")
 
+# anomaly model
+anomaly_model = joblib.load(
+    "anomaly_model.pkl"
+)
 
-############  FEATURES
+print("✅ Anomaly model loaded")
+
+# scaler
+try:
+
+    anomaly_scaler = joblib.load(
+        "scaler.pkl"
+    )
+
+    print("✅ Scaler loaded")
+
+except:
+
+    anomaly_scaler = None
+
+    print("⚠️ scaler.pkl not found")
+
+# ==================================================
+# FEATURES
+# ==================================================
 
 feature_cols = [
     "lag1",
@@ -67,8 +103,9 @@ feature_cols = [
     "weekday"
 ]
 
-
-#############  STEG prices
+# ==================================================
+# STEG PRICES
+# ==================================================
 
 def get_steg_price(monthly_kwh):
 
@@ -90,14 +127,17 @@ def get_steg_price(monthly_kwh):
     else:
         return 0.350
 
-
-############ get firestore data
+# ==================================================
+# GET FIRESTORE DATA
+# ==================================================
 
 def get_firestore_data():
 
     try:
 
-        docs = db.collection("energy").stream()
+        docs = db.collection(
+            "energy"
+        ).stream()
 
         readings = []
 
@@ -114,7 +154,6 @@ def get_firestore_data():
 
         df = pd.DataFrame(readings)
 
-        
         df = df.sort_values("id")
 
         if "power" not in df.columns:
@@ -125,7 +164,6 @@ def get_firestore_data():
 
         if "current" not in df.columns:
             df["current"] = 0
-
 
         df["power"] = pd.to_numeric(
             df["power"],
@@ -142,8 +180,9 @@ def get_firestore_data():
             errors="coerce"
         )
 
-        # remove invalid rows
-        df = df.dropna(subset=["power"])
+        df = df.dropna(
+            subset=["power"]
+        )
 
         if len(df) == 0:
             return None
@@ -152,12 +191,16 @@ def get_firestore_data():
 
     except Exception as e:
 
-        print("❌ Firestore Error:", e)
+        print(
+            "❌ Firestore Error:",
+            e
+        )
 
         return None
 
-
-############  get last values 
+# ==================================================
+# GET LAST READINGS
+# ==================================================
 
 def get_last_readings():
 
@@ -166,7 +209,11 @@ def get_last_readings():
     if df is None:
         return None
 
-    values = df["power"].tail(7).values / 1000
+    values = (
+        df["power"]
+        .tail(7)
+        .values / 1000
+    )
 
     if len(values) == 0:
         return None
@@ -185,14 +232,193 @@ def get_last_readings():
 
     return values
 
-############  preduction function
+# ==================================================
+# ANOMALY DETECTION
+# ==================================================
 
-def predict_next_month(last_values, days=30):
+def detect_anomaly(df):
+
+    try:
+
+        if df is None or len(df) == 0:
+
+            return {
+
+                "anomaly": False,
+
+                "score": 0,
+
+                "message": "No data"
+            }
+
+        latest = df.iloc[-1]
+
+        features = pd.DataFrame([[
+
+            latest["power"] / 1000,
+            latest["voltage"]
+
+        ]], columns=[
+
+            "Global_active_power",
+            "Voltage"
+
+        ])
+
+        # scale
+        if anomaly_scaler is not None:
+
+            features_scaled = (
+                anomaly_scaler.transform(
+                    features
+                )
+            )
+
+        else:
+
+            features_scaled = features
+
+        # predict
+        prediction = anomaly_model.predict(
+            features_scaled
+        )[0]
+
+        # score
+        score = anomaly_model.decision_function(
+            features_scaled
+        )[0]
+
+        is_anomaly = prediction == -1
+
+        message = (
+            "Unusual energy consumption detected"
+            if is_anomaly
+            else
+            "Normal consumption"
+        )
+
+        return {
+
+            "anomaly": bool(
+                is_anomaly
+            ),
+
+            "score": round(
+                float(score),
+                4
+            ),
+
+            "message": message
+        }
+
+    except Exception as e:
+
+        return {
+
+            "anomaly": False,
+
+            "score": 0,
+
+            "message": str(e)
+        }
+
+# ==================================================
+# FCM TOKEN
+# ==================================================
+
+def get_user_fcm_token():
+
+    try:
+
+        doc = db.collection(
+            "users"
+        ).document(
+            "user1"
+        ).get()
+
+        if doc.exists:
+
+            data = doc.to_dict()
+
+            return data.get(
+                "fcmToken"
+            )
+
+        return None
+
+    except Exception as e:
+
+        print(
+            "❌ Token Error:",
+            e
+        )
+
+        return None
+
+# ==================================================
+# SEND PUSH NOTIFICATION
+# ==================================================
+
+def send_push_notification(
+
+    token,
+    title,
+    body
+
+):
+
+    try:
+
+        message = messaging.Message(
+
+            notification=messaging.Notification(
+
+                title=title,
+                body=body
+            ),
+
+            token=token
+        )
+
+        response = messaging.send(
+            message
+        )
+
+        print(
+            "✅ Notification sent:",
+            response
+        )
+
+        return True
+
+    except Exception as e:
+
+        print(
+            "❌ FCM Error:",
+            e
+        )
+
+        return False
+
+# ==================================================
+# PREDICTION FUNCTION
+# ==================================================
+
+def predict_next_month(
+
+    last_values,
+    days=30
+
+):
 
     future_dates = pd.date_range(
+
         start=datetime.now(),
+
         periods=days + 1,
+
         freq="D"
+
     )[1:]
 
     predictions = []
@@ -221,15 +447,20 @@ def predict_next_month(last_values, days=30):
 
         try:
 
-            pred = model.predict(input_data)[0]
+            pred = model.predict(
+                input_data
+            )[0]
 
         except Exception as e:
 
             return {
-                "error": f"Prediction Error: {str(e)}"
+                "error":
+                f"Prediction Error: {str(e)}"
             }
 
-        predictions.append(float(pred))
+        predictions.append(
+            float(pred)
+        )
 
         # update memory
         last_values = np.append(
@@ -237,14 +468,17 @@ def predict_next_month(last_values, days=30):
             pred
         )
 
-
-    ############ monthly calculation
+    # ==================================================
+    # MONTHLY ENERGY
+    # ==================================================
 
     total_month_energy_kwh = 0
 
     for pred in predictions:
 
-        total_month_energy_kwh += pred * 24
+        total_month_energy_kwh += (
+            pred * 24
+        )
 
     price_per_kwh = get_steg_price(
         total_month_energy_kwh
@@ -255,7 +489,9 @@ def predict_next_month(last_values, days=30):
         price_per_kwh
     )
 
-    # Daily results
+    # ==================================================
+    # DAILY RESULTS
+    # ==================================================
 
     daily_results = []
 
@@ -266,9 +502,13 @@ def predict_next_month(last_values, days=30):
 
         prediction_kw = float(pred)
 
-        prediction_w = prediction_kw * 1000
+        prediction_w = (
+            prediction_kw * 1000
+        )
 
-        energy_kwh = prediction_kw * 24
+        energy_kwh = (
+            prediction_kw * 24
+        )
 
         daily_cost = (
             energy_kwh *
@@ -277,7 +517,9 @@ def predict_next_month(last_values, days=30):
 
         daily_results.append({
 
-            "date": date.strftime("%Y-%m-%d"),
+            "date": date.strftime(
+                "%Y-%m-%d"
+            ),
 
             "prediction_kw": round(
                 prediction_kw,
@@ -294,7 +536,8 @@ def predict_next_month(last_values, days=30):
                 2
             ),
 
-            "estimated_daily_cost_tnd": round(
+            "estimated_daily_cost_tnd":
+            round(
                 daily_cost,
                 2
             )
@@ -305,41 +548,49 @@ def predict_next_month(last_values, days=30):
 
         "monthly_summary": {
 
-            "predicted_total_energy_kwh": round(
+            "predicted_total_energy_kwh":
+            round(
                 total_month_energy_kwh,
                 2
             ),
 
-            "steg_price_per_kwh_tnd": price_per_kwh,
+            "steg_price_per_kwh_tnd":
+            price_per_kwh,
 
-            "estimated_total_bill_tnd": round(
+            "estimated_total_bill_tnd":
+            round(
                 total_month_cost,
                 2
             ),
 
-            "average_daily_cost_tnd": round(
+            "average_daily_cost_tnd":
+            round(
                 total_month_cost / days,
                 2
             )
 
         },
 
-        "daily_predictions": daily_results
-
+        "daily_predictions":
+        daily_results
     }
 
-
-#############  routes
+# ==================================================
+# ROUTES
+# ==================================================
 
 @app.get("/")
 def home():
 
     return {
-        "message": "Smart Energy API Running"
+
+        "message":
+        "Smart Energy API Running"
     }
 
-
-#############  health check
+# ==================================================
+# HEALTH CHECK
+# ==================================================
 
 @app.get("/health")
 def health():
@@ -348,8 +599,9 @@ def health():
         "status": "ok"
     }
 
-
-#############  live data
+# ==================================================
+# LIVE DATA
+# ==================================================
 
 @app.get("/live")
 def live():
@@ -359,10 +611,37 @@ def live():
     if df is None:
 
         return {
-            "error": "No Firestore data"
+            "error":
+            "No Firestore data"
         }
 
     latest = df.iloc[-1]
+
+    # anomaly detection
+    anomaly_result = detect_anomaly(
+        df
+    )
+
+    # ==================================================
+    # SEND NOTIFICATION
+    # ==================================================
+
+    if anomaly_result["anomaly"]:
+
+        token = get_user_fcm_token()
+
+        if token:
+
+            send_push_notification(
+
+                token=token,
+
+                title="⚠️ Energy Alert",
+
+                body=anomaly_result[
+                    "message"
+                ]
+            )
 
     return {
 
@@ -371,7 +650,9 @@ def live():
         ),
 
         "power_kw": round(
-            float(latest["power"]) / 1000,
+            float(
+                latest["power"]
+            ) / 1000,
             3
         ),
 
@@ -381,12 +662,27 @@ def live():
 
         "current": float(
             latest["current"]
-        )
+        ),
 
+        "anomaly":
+        anomaly_result[
+            "anomaly"
+        ],
+
+        "anomaly_score":
+        anomaly_result[
+            "score"
+        ],
+
+        "anomaly_message":
+        anomaly_result[
+            "message"
+        ]
     }
 
-
-#############  month preduction
+# ==================================================
+# MONTH PREDICTION
+# ==================================================
 
 @app.get("/predict")
 def predict():
@@ -396,18 +692,26 @@ def predict():
     if last_values is None:
 
         return {
-            "error": "No Firestore data"
+
+            "error":
+            "No Firestore data"
         }
 
-    return predict_next_month(last_values)
+    return predict_next_month(
+        last_values
+    )
 
-
-#############  main
+# ==================================================
+# MAIN
+# ==================================================
 
 if __name__ == "__main__":
 
     port = int(
-        os.environ.get("PORT", 8000)
+        os.environ.get(
+            "PORT",
+            8000
+        )
     )
 
     uvicorn.run(
